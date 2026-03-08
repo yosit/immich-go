@@ -61,8 +61,8 @@ func isRetryable(err error) bool {
 		return true
 	}
 
-	// EOF errors (server dropped connection)
-	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+	// EOF / closed pipe errors (server dropped connection)
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, io.ErrClosedPipe) {
 		return true
 	}
 

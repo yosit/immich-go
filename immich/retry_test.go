@@ -37,6 +37,8 @@ func TestIsRetryable(t *testing.T) {
 		{"wrapped retryable", fmt.Errorf("outer: %w", callError{status: 503}), true},
 		{"closed network connection", net.ErrClosed, true},
 		{"wrapped closed connection", fmt.Errorf("write tcp: %w", net.ErrClosed), true},
+		{"closed pipe", io.ErrClosedPipe, true},
+		{"wrapped closed pipe", fmt.Errorf("upload: %w", io.ErrClosedPipe), true},
 		{"callError wrapping network error", callError{status: 0, err: net.ErrClosed}, true},
 		{"callError wrapping connection reset", callError{status: 0, err: syscall.ECONNRESET}, true},
 		{"callError wrapping EOF", callError{status: 0, err: io.EOF}, true},
