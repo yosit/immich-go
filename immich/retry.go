@@ -31,10 +31,20 @@ func isRetryable(err error) bool {
 		return false
 	}
 
-	// Check for callError with retryable status code
+	// Check for callError with retryable status code.
+	// When status is 0 (no HTTP response — network failed before server replied),
+	// check the underlying error for retryability.
 	var ce callError
 	if errors.As(err, &ce) {
-		return retryableStatusCodes[ce.status]
+		if ce.status > 0 {
+			return retryableStatusCodes[ce.status]
+		}
+		// No HTTP status: network error occurred before response.
+		// Check the wrapped error.
+		if ce.err != nil {
+			return isRetryable(ce.err)
+		}
+		return false
 	}
 
 	// Check for network errors
@@ -43,8 +53,11 @@ func isRetryable(err error) bool {
 		return true
 	}
 
-	// Connection refused / reset
+	// Connection refused / reset / closed
 	if errors.Is(err, syscall.ECONNREFUSED) || errors.Is(err, syscall.ECONNRESET) {
+		return true
+	}
+	if errors.Is(err, net.ErrClosed) {
 		return true
 	}
 

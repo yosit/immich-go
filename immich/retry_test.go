@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"syscall"
 	"testing"
@@ -34,6 +35,12 @@ func TestIsRetryable(t *testing.T) {
 		{"unexpected EOF", io.ErrUnexpectedEOF, true},
 		{"net timeout", netTimeoutError{}, true},
 		{"wrapped retryable", fmt.Errorf("outer: %w", callError{status: 503}), true},
+		{"closed network connection", net.ErrClosed, true},
+		{"wrapped closed connection", fmt.Errorf("write tcp: %w", net.ErrClosed), true},
+		{"callError wrapping network error", callError{status: 0, err: net.ErrClosed}, true},
+		{"callError wrapping connection reset", callError{status: 0, err: syscall.ECONNRESET}, true},
+		{"callError wrapping EOF", callError{status: 0, err: io.EOF}, true},
+		{"callError with 400 and network err", callError{status: 400, err: net.ErrClosed}, false},
 		{"generic error", errors.New("something"), false},
 	}
 

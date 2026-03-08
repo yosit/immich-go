@@ -132,14 +132,17 @@ func (ic *ImmichClient) uploadAssetOnce(ctx context.Context, la *assets.Asset, e
 		errChan <- nil
 	}()
 
+	// Use doOnce (not do) because the multipart pipe body cannot be re-read.
+	// The outer retry loop in uploadAsset handles retries by re-opening the file
+	// and creating a fresh pipe.
 	var errCall error
 	switch endPoint {
 	case EndPointAssetUpload:
-		errCall = ic.newServerCall(ctx, EndPointAssetUpload).
-			do(postRequest("/assets", m.FormDataContentType(), setContextValue(callValues), setAcceptJSON(), setImmichChecksum(la), setBody(body)), responseJSON(&ar))
+		sc := ic.newServerCall(ctx, EndPointAssetUpload)
+		errCall = sc.doOnce(postRequest("/assets", m.FormDataContentType(), setContextValue(callValues), setAcceptJSON(), setImmichChecksum(la), setBody(body)), responseJSON(&ar))
 	case EndPointAssetReplace:
-		errCall = ic.newServerCall(ctx, EndPointAssetReplace).
-			do(putRequest("/assets/"+replaceID+"/original", setContextValue(callValues), setAcceptJSON(), setImmichChecksum(la), setContentType(m.FormDataContentType()), setBody(body)), responseJSON(&ar))
+		sc := ic.newServerCall(ctx, EndPointAssetReplace)
+		errCall = sc.doOnce(putRequest("/assets/"+replaceID+"/original", setContextValue(callValues), setAcceptJSON(), setImmichChecksum(la), setContentType(m.FormDataContentType()), setBody(body)), responseJSON(&ar))
 	}
 	if ar.Status == "duplicate" && errors.Is(err, io.ErrClosedPipe) {
 		err = nil // immich closes the connection when we upload the x-immich-checksum header and it finds a duplicate
