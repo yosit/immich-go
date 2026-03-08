@@ -99,6 +99,11 @@ func (app *Application) SetSupportedMedia(sm filetypes.SupportedMedia) {
 	app.sm = sm
 }
 
+// NumErrors returns the total number of errors recorded so far.
+func (app *Application) NumErrors() int64 {
+	return app.numErrors.Load()
+}
+
 func (app *Application) ProcessError(err error) error {
 	if err == nil {
 		return nil

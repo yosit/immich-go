@@ -473,6 +473,7 @@ func (uc *UpCmd) processMonth(ctx context.Context, adapter adapters.Reader, drp 
 
 	// Run the parallel initialization + upload using runMonthNoUI
 	// (always NoUI for batched mode to keep it simple and avoid UI flicker per month)
+	errsBefore := uc.app.NumErrors()
 	err := uc.runMonthNoUI(ctx, dr, groupChan)
 
 	// Clean up per-month resources
@@ -489,13 +490,23 @@ func (uc *UpCmd) processMonth(ctx context.Context, adapter adapters.Reader, drp 
 		return err
 	}
 
-	// Mark complete
-	uc.state.CompleteMonth(month)
-	if err := uc.state.SaveState(); err != nil {
-		uc.app.Log().Error("can't save state after completing month", "err", err)
+	// Only mark the month complete if no errors occurred during processing.
+	// In continue/retry mode, ProcessError swallows errors to keep going,
+	// but we must not mark the month done so that failed files are retried
+	// on the next run.
+	if uc.app.NumErrors() > errsBefore {
+		uc.app.Log().Warn(fmt.Sprintf("Month %s had errors, not marking as complete", month))
+		if err := uc.state.FlushState(); err != nil {
+			uc.app.Log().Error("can't save state", "err", err)
+		}
+	} else {
+		uc.state.CompleteMonth(month)
+		if err := uc.state.SaveState(); err != nil {
+			uc.app.Log().Error("can't save state after completing month", "err", err)
+		}
+		uc.app.Log().Info(fmt.Sprintf("Completed month: %s", month))
 	}
 
-	uc.app.Log().Info(fmt.Sprintf("Completed month: %s", month))
 	return nil
 }
 
