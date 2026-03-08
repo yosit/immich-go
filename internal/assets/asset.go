@@ -103,6 +103,18 @@ func (a *Asset) SetNameInfo(ni NameInfo) {
 	a.NameInfo = ni
 }
 
+// BestDate returns the best available date for the asset, following the
+// resolution order: CaptureDate, FileDate, NameInfo.Taken.
+func (a *Asset) BestDate() time.Time {
+	if !a.CaptureDate.IsZero() {
+		return a.CaptureDate
+	}
+	if !a.FileDate.IsZero() {
+		return a.FileDate
+	}
+	return a.Taken
+}
+
 func (a *Asset) UseMetadata(md *Metadata) *Metadata {
 	if md == nil {
 		return nil

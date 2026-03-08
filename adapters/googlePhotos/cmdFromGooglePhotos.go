@@ -63,7 +63,7 @@ type TakeoutCmd struct {
 
 	// Pre-scan state (for DateRangeProvider / batched upload)
 	catalogBuilt bool      // true after PreScan has built the catalog
-	targetMonth  string    // "YYYY-MM", "no-date", or "" (no filter)
+	targetMonth  string    // "YYYY-MM", adapters.MonthNoDate, or "" (no filter)
 	targetAfter  time.Time // inclusive lower bound for month filter
 	targetBefore time.Time // exclusive upper bound for month filter
 }

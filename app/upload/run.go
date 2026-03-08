@@ -273,9 +273,9 @@ func (uc *UpCmd) uploadBatched(ctx context.Context, adapter adapters.Reader, drp
 	}
 	uc.app.Log().Info(fmt.Sprintf("Pre-scan found %d months", len(months)))
 
-	// Check if there are no-date files; if so, add a "no-date" batch at the end
+	// Check if there are no-date files; if so, add a no-date batch at the end
 	if provider, ok := adapter.(interface{ HasNoDateFiles() bool }); ok && provider.HasNoDateFiles() {
-		months = append(months, "no-date")
+		months = append(months, adapters.MonthNoDate)
 	}
 
 	// 2. Load state
@@ -463,7 +463,7 @@ func (uc *UpCmd) processMonth(ctx context.Context, adapter adapters.Reader, drp 
 
 	// Determine the asset fetch function for this month
 	var dr *cliflags.DateRange
-	if month != "no-date" {
+	if month != adapters.MonthNoDate {
 		after, before, err := adapters.MonthToDateRange(month)
 		if err != nil {
 			return fmt.Errorf("invalid month %q: %w", month, err)
@@ -676,7 +676,7 @@ func (uc *UpCmd) getImmichAssets(ctx context.Context, updateFn progressUpdate) e
 
 // getImmichAssetsFiltered fetches server assets scoped to a date range
 // (used in batched mode). If the date range is not set, it falls back
-// to GetAllAssets (used for the "no-date" batch).
+// to GetAllAssets (used for the no-date batch).
 func (uc *UpCmd) getImmichAssetsFiltered(ctx context.Context, dr cliflags.DateRange, updateFn progressUpdate) error {
 	defer close(uc.immichAssetsReady)
 	received := 0
@@ -820,7 +820,7 @@ func (uc *UpCmd) handleGroup(ctx context.Context, g *assets.Group) error {
 	// Upload assets from the group
 	for _, a := range g.Assets {
 		err := uc.handleAsset(ctx, a)
-		errGroup = errors.Join(err)
+		errGroup = errors.Join(errGroup, err)
 	}
 
 	// Manage groups
@@ -1018,9 +1018,10 @@ func (uc *UpCmd) uploadAsset(ctx context.Context, a *assets.Asset) (string, erro
 		if fs, ok := a.File.FS().(interface{ Name() string }); ok {
 			source = fs.Name()
 		}
-		uc.state.RecordFileUploaded(source, a.File.Name(), int64(a.FileSize))
-		if err := uc.state.SaveState(); err != nil {
-			uc.app.Log().Error("can't save state after upload", "err", err)
+		if shouldSave := uc.state.RecordFileUploaded(source, a.File.Name(), int64(a.FileSize)); shouldSave {
+			if err := uc.state.SaveState(); err != nil {
+				uc.app.Log().Error("can't save state after upload", "err", err)
+			}
 		}
 	}
 

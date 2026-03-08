@@ -31,6 +31,15 @@ type Runner interface {
 	Run(cmd *cobra.Command, adapter Reader) error
 }
 
+// MonthNoDate is the sentinel value used to represent assets with no
+// determinable date in the month-based batching system.
+const MonthNoDate = "no-date"
+
+// TimeToMonth formats a time.Time as a "YYYY-MM" month string.
+func TimeToMonth(t time.Time) string {
+	return fmt.Sprintf("%04d-%02d", t.Year(), t.Month())
+}
+
 // MonthToDateRange converts a "YYYY-MM" string to a date range with
 // ±1 day padding for timezone safety.
 // For example, "2022-06" returns:

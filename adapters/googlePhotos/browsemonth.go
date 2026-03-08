@@ -2,7 +2,6 @@ package gp
 
 import (
 	"context"
-	"fmt"
 	"path"
 	"path/filepath"
 	"sort"
@@ -11,6 +10,7 @@ import (
 	"github.com/simulot/immich-go/adapters"
 	"github.com/simulot/immich-go/internal/assets"
 	"github.com/simulot/immich-go/internal/fileevent"
+	"github.com/simulot/immich-go/internal/gen"
 	"github.com/simulot/immich-go/internal/groups"
 )
 
@@ -34,18 +34,13 @@ func (toc *TakeoutCmd) PreScan(ctx context.Context) ([]string, error) {
 		for _, a := range cat.matchedFiles {
 			d := gpAssetDate(a)
 			if !d.IsZero() {
-				month := fmt.Sprintf("%04d-%02d", d.Year(), d.Month())
+				month := adapters.TimeToMonth(d)
 				monthSet[month] = struct{}{}
 			}
 		}
 	}
 
-	months := make([]string, 0, len(monthSet))
-	for m := range monthSet {
-		months = append(months, m)
-	}
-	sort.Strings(months)
-	return months, nil
+	return gen.MapKeysSorted(monthSet), nil
 }
 
 // BrowseMonth yields only assets whose date falls within the target month.
@@ -58,7 +53,7 @@ func (toc *TakeoutCmd) BrowseMonth(ctx context.Context, month string) chan *asse
 		return gOut
 	}
 
-	if month != "no-date" {
+	if month != adapters.MonthNoDate {
 		after, before, err := adapters.MonthToDateRange(month)
 		if err != nil {
 			close(gOut)
@@ -68,7 +63,7 @@ func (toc *TakeoutCmd) BrowseMonth(ctx context.Context, month string) chan *asse
 		toc.targetAfter = after
 		toc.targetBefore = before
 	} else {
-		toc.targetMonth = "no-date"
+		toc.targetMonth = adapters.MonthNoDate
 		toc.targetAfter = time.Time{}
 		toc.targetBefore = time.Time{}
 	}
@@ -115,7 +110,7 @@ func (toc *TakeoutCmd) passTwoForMonth(ctx context.Context, gOut chan *assets.Gr
 func (toc *TakeoutCmd) handleDirForMonth(ctx context.Context, dir string, gOut chan *assets.Group) error {
 	catalog := toc.catalogs[dir]
 	dirEntries := make([]*assets.Asset, 0, len(catalog.matchedFiles))
-	isNoDate := toc.targetMonth == "no-date"
+	isNoDate := toc.targetMonth == adapters.MonthNoDate
 
 	for name := range catalog.matchedFiles {
 		a := catalog.matchedFiles[name]
@@ -230,11 +225,5 @@ func (toc *TakeoutCmd) handleDirForMonth(ctx context.Context, dir string, gOut c
 
 // gpAssetDate returns the best available date for a Google Photos asset.
 func gpAssetDate(a *assets.Asset) time.Time {
-	if !a.CaptureDate.IsZero() {
-		return a.CaptureDate
-	}
-	if !a.FileDate.IsZero() {
-		return a.FileDate
-	}
-	return a.Taken
+	return a.BestDate()
 }

@@ -57,9 +57,9 @@ func TestThrottle_SetConcurrency(t *testing.T) {
 		t.Errorf("after SetConcurrency(0) = %d, want 1", th.Current())
 	}
 
-	th.SetConcurrency(20)
-	if th.Current() != 20 {
-		t.Errorf("after SetConcurrency(20) = %d, want 20", th.Current())
+	th.SetConcurrency(20) // clamped to max (10)
+	if th.Current() != 10 {
+		t.Errorf("after SetConcurrency(20) = %d, want 10 (clamped to max)", th.Current())
 	}
 }
 

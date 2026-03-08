@@ -2,13 +2,13 @@ package fromimmich
 
 import (
 	"context"
-	"fmt"
-	"sort"
 
+	"github.com/simulot/immich-go/adapters"
 	cliflags "github.com/simulot/immich-go/internal/cliFlags"
 
 	"github.com/simulot/immich-go/immich"
 	"github.com/simulot/immich-go/internal/assets"
+	"github.com/simulot/immich-go/internal/gen"
 )
 
 // PreScan queries the source Immich server for all matching assets and returns
@@ -86,7 +86,7 @@ func (fic *FromImmichCmd) PreScan(ctx context.Context) ([]string, error) {
 			d = a.FileCreatedAt.Time
 		}
 		if !d.IsZero() {
-			month := fmt.Sprintf("%04d-%02d", d.Year(), d.Month())
+			month := adapters.TimeToMonth(d)
 			monthSet[month] = struct{}{}
 		}
 		return nil
@@ -95,18 +95,13 @@ func (fic *FromImmichCmd) PreScan(ctx context.Context) ([]string, error) {
 		return nil, err
 	}
 
-	months := make([]string, 0, len(monthSet))
-	for m := range monthSet {
-		months = append(months, m)
-	}
-	sort.Strings(months)
-	return months, nil
+	return gen.MapKeysSorted(monthSet), nil
 }
 
 // BrowseMonth yields only assets whose date falls within the target month.
 // It temporarily overrides the date range filter and delegates to Browse.
 func (fic *FromImmichCmd) BrowseMonth(ctx context.Context, month string) chan *assets.Group {
-	if month == "no-date" {
+	if month == adapters.MonthNoDate {
 		// Immich assets always have dates from the server, return empty channel
 		ch := make(chan *assets.Group)
 		close(ch)

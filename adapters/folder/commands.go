@@ -2,10 +2,8 @@ package folder
 
 import (
 	"context"
-	"fmt"
 	"io/fs"
 	"path/filepath"
-	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -65,7 +63,7 @@ type ImportFolderCmd struct {
 
 	// Month filter for BrowseMonth — when set, parseDir skips files
 	// not matching this month BEFORE extracting from zip.
-	targetMonth  string    // "YYYY-MM", "no-date", or "" (no filter)
+	targetMonth  string    // "YYYY-MM", adapters.MonthNoDate, or "" (no filter)
 	targetAfter  time.Time // inclusive lower bound
 	targetBefore time.Time // exclusive upper bound
 }
@@ -76,7 +74,7 @@ func (ifc *ImportFolderCmd) addMonth(t time.Time) {
 	if t.IsZero() {
 		return
 	}
-	month := fmt.Sprintf("%04d-%02d", t.Year(), t.Month())
+	month := adapters.TimeToMonth(t)
 	ifc.monthsMu.Lock()
 	defer ifc.monthsMu.Unlock()
 	if ifc.activeMonthSet == nil {
@@ -96,11 +94,7 @@ func (ifc *ImportFolderCmd) setNoDateFiles() {
 func (ifc *ImportFolderCmd) buildSortedMonths() {
 	ifc.monthsMu.Lock()
 	defer ifc.monthsMu.Unlock()
-	ifc.activeMonths = make([]string, 0, len(ifc.activeMonthSet))
-	for m := range ifc.activeMonthSet {
-		ifc.activeMonths = append(ifc.activeMonths, m)
-	}
-	sort.Strings(ifc.activeMonths)
+	ifc.activeMonths = gen.MapKeysSorted(ifc.activeMonthSet)
 }
 
 // ActiveMonths returns the sorted list of YYYY-MM strings discovered during pre-scan.
@@ -270,8 +264,11 @@ func (ifc *ImportFolderCmd) preScanDir(ctx context.Context, fsys fs.FS, dir stri
 		if !info.Taken.IsZero() {
 			ifc.addMonth(info.Taken)
 		} else {
-			// Try file modification time as fallback
-			fi, err := fs.Stat(fsys, name)
+			// Use entry.Info() instead of fs.Stat() — for zip filesystems,
+			// fs.Stat opens each file (seeking into the zip body) just to
+			// read metadata that's already in the central directory.
+			// entry.Info() returns the same data without any I/O.
+			fi, err := entry.Info()
 			if err == nil && !fi.ModTime().IsZero() {
 				ifc.addMonth(fi.ModTime())
 			} else {

@@ -54,14 +54,13 @@ func TestStateSaveLoadRoundTrip(t *testing.T) {
 		Min: time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC),
 		Max: time.Date(2024, 12, 31, 0, 0, 0, 0, time.UTC),
 	}
-	original.CompletedMonths = []string{"2020-01", "2020-02", "2020-03"}
-	original.InProgress = InProgress{
-		Month: "2020-04",
-		UploadedFiles: []UploadedFile{
-			{Source: "archive.zip", Path: "Photos/IMG_001.HEIC", Size: 1234567},
-			{Source: "archive.zip", Path: "Photos/IMG_002.JPG", Size: 7654321},
-		},
-	}
+	// Use the proper API to populate state so lookup sets stay in sync
+	original.CompleteMonth("2020-01")
+	original.CompleteMonth("2020-02")
+	original.CompleteMonth("2020-03")
+	original.SetInProgressMonth("2020-04")
+	original.RecordFileUploaded("archive.zip", "Photos/IMG_001.HEIC", 1234567)
+	original.RecordFileUploaded("archive.zip", "Photos/IMG_002.JPG", 7654321)
 
 	if err := original.SaveState(); err != nil {
 		t.Fatalf("SaveState failed: %v", err)
@@ -232,12 +231,13 @@ func TestStateResetState(t *testing.T) {
 		t.Fatalf("LoadState failed: %v", err)
 	}
 
-	// Populate state
+	// Populate state using proper API
 	s.DateRange = StateDateRange{
 		Min: time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC),
 		Max: time.Date(2024, 12, 31, 0, 0, 0, 0, time.UTC),
 	}
-	s.CompletedMonths = []string{"2020-01", "2020-02"}
+	s.CompleteMonth("2020-01")
+	s.CompleteMonth("2020-02")
 	s.SetInProgressMonth("2020-03")
 	s.RecordFileUploaded("archive.zip", "Photos/IMG_001.HEIC", 1000)
 

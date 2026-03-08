@@ -61,7 +61,7 @@ func (uc *UpCmd) runNoUI(ctx context.Context, app *app.Application) error {
 				elapsed := now.Sub(prevTime).Seconds()
 				if elapsed > 0 {
 					bps := float64(currentSize-prevSize) / elapsed
-					speedStr = formatSpeedNoUI(bps)
+					speedStr = formatSpeed(bps)
 				}
 			}
 			prevSize = currentSize
@@ -152,7 +152,8 @@ func (uc *UpCmd) runNoUI(ctx context.Context, app *app.Application) error {
 	return err
 }
 
-func formatSpeedNoUI(bytesPerSec float64) string {
+// formatSpeed formats bytes/sec as a human-readable speed string.
+func formatSpeed(bytesPerSec float64) string {
 	if bytesPerSec < 1 {
 		return "—"
 	}

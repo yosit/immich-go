@@ -40,19 +40,33 @@ func (t *Throttle) Release() {
 	<-sem
 }
 
-// SetConcurrency changes the concurrency level by replacing the semaphore channel.
-// In-flight tasks continue to hold slots on the old channel; new tasks use the new one.
+// SetConcurrency adjusts the concurrency level by draining or adding tokens
+// to the existing semaphore channel. In-flight workers are not affected because
+// they acquired/release on the same channel instance.
 // Minimum concurrency is 1.
 func (t *Throttle) SetConcurrency(n int) {
 	if n < 1 {
 		n = 1
+	}
+	if n > t.max {
+		n = t.max // cannot exceed original capacity (channel buffer size)
 	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if n == t.current {
 		return
 	}
-	t.sem = make(chan struct{}, n)
+	if n < t.current {
+		// Reduce: fill extra slots so fewer workers can acquire.
+		for i := n; i < t.current; i++ {
+			t.sem <- struct{}{}
+		}
+	} else {
+		// Increase: drain blocked slots to free capacity.
+		for i := t.current; i < n; i++ {
+			<-t.sem
+		}
+	}
 	t.current = n
 }
 

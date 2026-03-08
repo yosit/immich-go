@@ -151,7 +151,7 @@ func (ifc *ImportFolderCmd) Browse(ctx context.Context) chan *assets.Group {
 func (ifc *ImportFolderCmd) BrowseMonth(ctx context.Context, month string) chan *assets.Group {
 	// Set the target month filter — parseDir will check this before extraction
 	ifc.targetMonth = month
-	if month != "no-date" {
+	if month != adapters.MonthNoDate {
 		after, before, err := adapters.MonthToDateRange(month)
 		if err != nil {
 			ch := make(chan *assets.Group)
@@ -169,16 +169,9 @@ func (ifc *ImportFolderCmd) BrowseMonth(ctx context.Context, month string) chan 
 	return ifc.Browse(ctx)
 }
 
-// assetDate returns the best available date for the asset, following the
-// resolution order: CaptureDate, FileDate, NameInfo.Taken.
+// assetDate returns the best available date for the asset.
 func assetDate(a *assets.Asset) time.Time {
-	if !a.CaptureDate.IsZero() {
-		return a.CaptureDate
-	}
-	if !a.FileDate.IsZero() {
-		return a.FileDate
-	}
-	return a.Taken
+	return a.BestDate()
 }
 
 // matchesTargetMonth checks if a file belongs to the target month using
@@ -186,7 +179,7 @@ func assetDate(a *assets.Asset) time.Time {
 // Returns true if the file matches or if we can't determine the date
 // (to avoid dropping files that might belong).
 func (ifc *ImportFolderCmd) matchesTargetMonth(fsName, name, base string) bool {
-	isNoDate := ifc.targetMonth == "no-date"
+	isNoDate := ifc.targetMonth == adapters.MonthNoDate
 
 	// Try iCloud metadata first (most reliable for iCloud archives)
 	if ifc.ICloudTakeout && ifc.icloudMetas != nil {

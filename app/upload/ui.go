@@ -736,29 +736,13 @@ func (ui *uiPage) updateStatusZone() {
 			ui.uploadStartTime = time.Now()
 		} else if elapsed := time.Since(ui.uploadStartTime).Seconds(); elapsed > 0 {
 			bytesPerSec := float64(processedSize) / elapsed
-			speed := ui.formatSpeed(bytesPerSec)
+			speed := formatSpeed(bytesPerSec)
 			ui.statusZone.SetTitle(fmt.Sprintf("Progress - %s", speed))
 			ui.statusViews["uploadedSize"].SetText(fmt.Sprintf("%s (%s)", ui.formatBytes(processedSize), speed))
 		}
 	}
 }
 
-// formatSpeed formats bytes/sec as human-readable speed string
-func (ui *uiPage) formatSpeed(bytesPerSec float64) string {
-	if bytesPerSec < 1 {
-		return "— "
-	}
-	const unit = 1024
-	if bytesPerSec < unit {
-		return fmt.Sprintf("%.0f B/s", bytesPerSec)
-	}
-	div, exp := float64(unit), 0
-	for n := bytesPerSec / unit; n >= unit; n /= unit {
-		div *= unit
-		exp++
-	}
-	return fmt.Sprintf("%.1f %cB/s", bytesPerSec/div, "KMGTPE"[exp])
-}
 
 // formatBytes formats byte count as human-readable string
 func (ui *uiPage) formatBytes(bytes int64) string {
