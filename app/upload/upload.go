@@ -3,6 +3,7 @@ package upload
 import (
 	"context"
 	"fmt"
+	"sync/atomic"
 	"time"
 
 	"github.com/simulot/immich-go/adapters"
@@ -12,6 +13,7 @@ import (
 	"github.com/simulot/immich-go/adapters/shared"
 	"github.com/simulot/immich-go/app"
 	"github.com/simulot/immich-go/immich"
+	cliflags "github.com/simulot/immich-go/internal/cliFlags"
 	"github.com/simulot/immich-go/internal/assets"
 	"github.com/simulot/immich-go/internal/assets/cache"
 	"github.com/simulot/immich-go/internal/assettracker"
@@ -62,6 +64,12 @@ type UpCmd struct {
 	SessionTag bool
 	session    string // Session tag value
 
+	// Batched upload flags
+	BatchLimit int    // max months to process (0 = unlimited)
+	StateDir   string // override state directory
+	ResetState bool   // clear saved state
+	ShowState  bool   // print state and exit
+
 	// Upload command state
 	// Filters           []filters.Filter
 	tz                *time.Location
@@ -70,6 +78,7 @@ type UpCmd struct {
 	assetIndex        *immichIndex                         // List of assets present on the server
 	localAssets       *syncset.Set[string]                 // List of assets present on the local input by name+size
 	immichAssetsReady chan struct{}                        // Signal that the asset index is ready
+	immichAlbumsReady chan struct{}                        // Signal that server albums have been merged into albumsCache
 	deleteServerList  []*immich.Asset                      // List of server assets to remove
 	adapter           adapters.Reader                      // the source of assets
 	DebugCounters     bool                                 // Enable CSV action counters per file
@@ -77,6 +86,14 @@ type UpCmd struct {
 	tagsCache         *cache.CollectionCache[assets.Tag]   // List of tags present on the server
 	finished          bool                                 // the finish task has been run
 	infoCollector     *filenames.InfoCollector             // Collects information about the files being processed
+	state             *State                               // runtime state tracking for batched uploads
+	currentMonth      string                               // current month being processed in batched mode
+	batchCurrent      int                                  // index of current month (1-based)
+	batchTotal        int                                  // total months being processed in this run
+	resumeSkipped     atomic.Int64                         // count of files skipped due to resume state
+	immichUpdateFn    progressUpdate                       // callback for Immich asset reading progress (set by UI)
+	cachedAlbums      []albumResult                        // cached album details from server (fetched once)
+	albumsFetched     bool                                 // true after album details have been fetched
 }
 
 func (uc *UpCmd) RegisterFlags(flags *pflag.FlagSet) {
@@ -85,6 +102,12 @@ func (uc *UpCmd) RegisterFlags(flags *pflag.FlagSet) {
 	flags.BoolVar(&uc.Overwrite, "overwrite", false, "Always overwrite files on the server with local versions")
 	flags.StringSliceVar(&uc.Tags, "tag", nil, "Add tags to the imported assets. Can be specified multiple times. Hierarchy is supported using a / separator (e.g. 'tag1/subtag1')")
 	flags.BoolVar(&uc.SessionTag, "session-tag", false, "Tag uploaded photos with a tag \"{immich-go}/YYYY-MM-DD HH-MM-SS\"")
+
+	// Batched upload flags
+	flags.IntVar(&uc.BatchLimit, "batch-limit", 0, "Process at most N months then stop (0 = unlimited)")
+	flags.StringVar(&uc.StateDir, "state-dir", "", "Override state directory (default: ~/.config/immich-go/state/)")
+	flags.BoolVar(&uc.ResetState, "reset-state", false, "Clear saved state and start fresh")
+	flags.BoolVar(&uc.ShowState, "show-state", false, "Print current state (completed/remaining months) and exit")
 
 	uc.StackOptions.RegisterFlags(flags)
 }
@@ -149,6 +172,13 @@ func (uc *UpCmd) Run(cmd *cobra.Command, adapter adapters.Reader) error {
 	uc.tz = uc.app.GetTZ()
 	uc.app.SetSupportedMedia(uc.client.Immich.SupportedMedia())
 
+	// Enable retry on the immich client when --on-errors=retry
+	if uc.app.OnErrors == cliflags.OnErrorsRetry {
+		if ic, ok := uc.client.Immich.(*immich.ImmichClient); ok {
+			ic.RetryEnabled = true
+		}
+	}
+
 	// Initialize the FileProcessor if not already done
 	if uc.app.FileProcessor() == nil {
 		recorder := fileevent.NewRecorder(uc.app.Log().Logger)
@@ -171,6 +201,18 @@ func (uc *UpCmd) Run(cmd *cobra.Command, adapter adapters.Reader) error {
 	uc.Groupers = append(uc.Groupers, series.Group)
 	uc.Filters = append(uc.Filters, uc.ManageBurst.GroupFilter(), uc.ManageRawJPG.GroupFilter(), uc.ManageHEICJPG.GroupFilter())
 	uc.infoCollector = filenames.NewInfoCollector(uc.tz, uc.app.GetSupportedMedia())
+
+	// Handle --show-state and --reset-state early before full upload setup.
+	// For adapters that don't support batching, these flags are no-ops.
+	if uc.ShowState || uc.ResetState {
+		if _, hasBatching := adapter.(adapters.DateRangeProvider); !hasBatching {
+			// Non-batching adapters don't use state files; inform the user.
+			fmt.Println("State tracking is only available for batched upload sources (e.g., from-icloud).")
+			if uc.ShowState {
+				return nil
+			}
+		}
+	}
 
 	return uc.upload(ctx, adapter)
 }

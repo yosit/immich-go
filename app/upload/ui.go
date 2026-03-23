@@ -54,6 +54,13 @@ type uiPage struct {
 	immichUpload  *tvxwidgets.PercentageModeGauge
 
 	watchJobs bool
+
+	// Batch progress (for batched upload mode)
+	batchInfoView     *tview.TextView
+	resumeSkippedView *tview.TextView
+
+	// Speed tracking
+	uploadStartTime time.Time // set when first bytes are processed
 }
 
 func (ui *uiPage) highJackLogger(app *app.Application) {
@@ -254,6 +261,153 @@ func (uc *UpCmd) runUI(ctx context.Context, app *app.Application) error {
 	return err
 }
 
+// runBatchedUI runs the TUI for batched upload mode.
+// It starts the TUI once and runs the month loop inside it, so the user
+// sees live counters and progress across all months.
+func (uc *UpCmd) runBatchedUI(ctx context.Context, monthLoop func(ctx context.Context) error) error {
+	ctx, cancel := context.WithCancelCause(ctx)
+	uiApp := tview.NewApplication()
+	ui := uc.newUI(ctx, uc.app)
+
+	defer cancel(nil)
+	pages := tview.NewPages()
+
+	var uploadDone atomic.Bool
+	var uiGroup errgroup.Group
+	var messages strings.Builder
+
+	uiApp.SetRoot(pages, true)
+
+	stopUI := func(err error) {
+		cancel(err)
+		if uiApp != nil {
+			uiApp.Stop()
+		}
+	}
+
+	pages.AddPage("ui", ui.screen, true, true)
+
+	// handle Ctrl+C and Ctrl+Q
+	uiApp.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		switch event.Key() {
+		case tcell.KeyCtrlQ, tcell.KeyCtrlC:
+			ui.restoreLogger(uc.app)
+			cancel(errors.New("interrupted: Ctrl+C or Ctrl+Q pressed"))
+		case tcell.KeyEnter:
+			if uploadDone.Load() {
+				stopUI(nil)
+			}
+		}
+		return event
+	})
+
+	// update server status
+	if ui.watchJobs {
+		go func() {
+			tick := time.NewTicker(250 * time.Millisecond)
+			for {
+				select {
+				case <-ctx.Done():
+					tick.Stop()
+					return
+				case <-tick.C:
+					jobs, err := uc.client.AdminImmich.GetJobs(ctx)
+					if err == nil {
+						jobCount := 0
+						jobWaiting := 0
+						for _, j := range jobs {
+							jobCount += j.JobCounts.Active
+							jobWaiting += j.JobCounts.Waiting
+						}
+						_, _, w, _ := ui.serverJobs.GetInnerRect()
+						ui.serverActivity = append(ui.serverActivity, float64(jobCount))
+						if len(ui.serverActivity) > w {
+							ui.serverActivity = ui.serverActivity[1:]
+						}
+						ui.serverJobs.SetData(ui.serverActivity)
+						ui.serverJobs.SetTitle(fmt.Sprintf("Server's jobs: active: %d, waiting: %d", jobCount, jobWaiting))
+						if jobCount > 0 {
+							ui.lastTimeServerActive.Store(time.Now().Unix())
+						}
+					}
+				}
+			}
+		}()
+	}
+
+	// force the ui to redraw counters
+	go func() {
+		tick := time.NewTicker(100 * time.Millisecond)
+		for {
+			select {
+			case <-ctx.Done():
+				tick.Stop()
+				return
+			case <-tick.C:
+				uiApp.QueueUpdateDraw(func() {
+					counts := uc.app.FileProcessor().Logger().GetCounts()
+					sizes := uc.app.FileProcessor().Logger().GetEventSizes()
+					for c := range ui.counts {
+						ui.getCountView(c, counts[c])
+						ui.updateSizeView(c, sizes[c])
+					}
+					ui.updateStatusZone()
+					if ui.batchInfoView != nil && uc.batchTotal > 0 {
+						ui.batchInfoView.SetText(fmt.Sprintf("Batch %d/%d: %s", uc.batchCurrent, uc.batchTotal, uc.currentMonth))
+					}
+					if ui.resumeSkippedView != nil {
+						ui.resumeSkippedView.SetText(fmt.Sprintf("%d", uc.resumeSkipped.Load()))
+					}
+				})
+			}
+		}
+	}()
+
+	// start the UI
+	uiGroup.Go(func() error {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+			err := uiApp.Run()
+			cancel(err)
+			return err
+		}
+	})
+
+	// Wire the Immich content progress bar to the batched asset fetching
+	uc.immichUpdateFn = ui.updateImmichReading
+
+	// run the month loop
+	uiGroup.Go(func() error {
+		err := monthLoop(ctx)
+
+		err = errors.Join(err, uc.finishing(ctx))
+
+		uploadDone.Store(true)
+		counts := uc.app.FileProcessor().Logger().GetCounts()
+		if counts[fileevent.ErrorUploadFailed]+counts[fileevent.ErrorServerError]+counts[fileevent.ErrorFileAccess]+counts[fileevent.ErrorIncomplete] > 0 {
+			messages.WriteString("Some errors have occurred. Look at the log file for details\n")
+		}
+
+		modal := newModal(messages.String())
+		pages.AddPage("modal", modal, true, false)
+		pages.ShowPage("modal")
+
+		return err
+	})
+
+	err := uiGroup.Wait()
+	if err != nil {
+		err = context.Cause(ctx)
+	}
+
+	if messages.Len() > 0 {
+		return errors.New(messages.String())
+	}
+	return err
+}
+
 func newModal(message string) tview.Primitive {
 	message += "\nYou can quit the program safely.\n\nPress the [enter] key to exit."
 	lines := strings.Count(message, "\n")
@@ -436,11 +590,15 @@ func (ui *uiPage) createDiscoveryZone() *tview.Grid {
 	ui.addCounter(discovery, 6, "Banned", fileevent.DiscardedBanned)
 	// Row 7: Missing sidecar
 	ui.addCounter(discovery, 7, "Missing sidecar", fileevent.ProcessedMissingMetadata)
-	// Row 8: Total discovered
-	discovery.AddItem(tview.NewTextView().SetText("Total discovered"), 8, 0, 1, 1, 0, 0, false)
-	ui.addDiscoveryCounter(discovery, 8, "discoveredCount", "discoveredSize")
+	// Row 8: Skipped (resume) — custom counter, not a fileevent
+	discovery.AddItem(tview.NewTextView().SetText("Skipped (resume)"), 8, 0, 1, 1, 0, 0, false)
+	ui.resumeSkippedView = tview.NewTextView().SetTextAlign(tview.AlignRight).SetText("0")
+	discovery.AddItem(ui.resumeSkippedView, 8, 1, 1, 1, 0, 0, false)
+	// Row 9: Total discovered
+	discovery.AddItem(tview.NewTextView().SetText("Total discovered"), 9, 0, 1, 1, 0, 0, false)
+	ui.addDiscoveryCounter(discovery, 9, "discoveredCount", "discoveredSize")
 
-	discovery.SetSize(9, 4, 1, 1).SetColumns(20, 8, 2, 10)
+	discovery.SetSize(10, 4, 1, 1).SetColumns(20, 8, 2, 10)
 	return discovery
 }
 
@@ -459,8 +617,11 @@ func (ui *uiPage) createProcessingZone() *tview.Grid {
 	ui.addProcessingCounter(processing, 3, "Tagged", fileevent.ProcessedTagged)
 	// Row 4: Metadata updated
 	ui.addProcessingCounter(processing, 4, "Metadata updated", fileevent.ProcessedMetadataUpdated)
+	// Row 5: Batch info (empty until batched mode sets it)
+	ui.batchInfoView = tview.NewTextView().SetDynamicColors(true)
+	processing.AddItem(ui.batchInfoView, 5, 0, 1, 2, 0, 0, false)
 
-	processing.SetSize(5, 2, 1, 1).SetColumns(20, 10)
+	processing.SetSize(6, 2, 1, 1).SetColumns(20, 10)
 	return processing
 }
 
@@ -529,9 +690,13 @@ func (ui *uiPage) addDiscoveryCounter(g *tview.Grid, row int, countKey, sizeKey 
 
 // updateStatusZone updates the status zone with current asset tracker data
 func (ui *uiPage) updateStatusZone() {
+	if ui.fileProcessor != nil {
+		ui.tracker = ui.fileProcessor.Tracker()
+	}
 	if ui.tracker == nil {
 		return
 	}
+
 
 	// Get current counters
 	pendingCount := ui.tracker.GetPendingCount()
@@ -564,7 +729,20 @@ func (ui *uiPage) updateStatusZone() {
 		ui.discoveryViews["discoveredCount"].SetText(fmt.Sprintf("%6d", totalCount))
 		ui.discoveryViews["discoveredSize"].SetText(ui.formatBytes(totalSize))
 	}
+
+	// Update upload speed (average since first upload completed)
+	if processedSize > 0 {
+		if ui.uploadStartTime.IsZero() {
+			ui.uploadStartTime = time.Now()
+		} else if elapsed := time.Since(ui.uploadStartTime).Seconds(); elapsed > 0 {
+			bytesPerSec := float64(processedSize) / elapsed
+			speed := formatSpeed(bytesPerSec)
+			ui.statusZone.SetTitle(fmt.Sprintf("Progress - %s", speed))
+			ui.statusViews["uploadedSize"].SetText(fmt.Sprintf("%s (%s)", ui.formatBytes(processedSize), speed))
+		}
+	}
 }
+
 
 // formatBytes formats byte count as human-readable string
 func (ui *uiPage) formatBytes(bytes int64) string {

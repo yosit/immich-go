@@ -4,18 +4,24 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/gdamore/tcell/v2"
 	"github.com/simulot/immich-go/adapters"
 	"github.com/simulot/immich-go/immich"
 	"github.com/simulot/immich-go/internal/assets"
 	"github.com/simulot/immich-go/internal/assets/cache"
+	"github.com/simulot/immich-go/internal/assettracker"
+	cliflags "github.com/simulot/immich-go/internal/cliFlags"
 	"github.com/simulot/immich-go/internal/fileevent"
 	"github.com/simulot/immich-go/internal/filters"
 	"github.com/simulot/immich-go/internal/fshelper"
 	"github.com/simulot/immich-go/internal/worker"
+	"golang.org/x/sync/errgroup"
 )
 
 func (uc *UpCmd) saveAlbum(ctx context.Context, album assets.Album, ids []string) (assets.Album, error) {
@@ -30,6 +36,11 @@ func (uc *UpCmd) saveAlbum(ctx context.Context, album assets.Album, ids []string
 		}
 		uc.app.Log().Info("created album", "album", album.Title, "assets", len(ids))
 		album.ID = r.ID
+
+		// Add newly created album to the cached data so subsequent months
+		// know it already exists and won't create duplicates.
+		uc.addAlbumToCache(r.ID, album.Title, album.Description, ids)
+
 		return album, nil
 	}
 	_, err := uc.client.Immich.AddAssetToAlbum(ctx, album.ID, ids)
@@ -38,7 +49,44 @@ func (uc *UpCmd) saveAlbum(ctx context.Context, album assets.Album, ids []string
 		return album, err
 	}
 	uc.app.Log().Info("updated album", "album", album.Title, "assets", len(ids))
+
+	// Update cached album data with newly added asset IDs
+	uc.appendAssetsToCachedAlbum(album.ID, ids)
+
 	return album, err
+}
+
+// addAlbumToCache appends a newly created album to cachedAlbums so that
+// subsequent months' getImmichAlbums merge will find it (avoiding duplicate creation).
+func (uc *UpCmd) addAlbumToCache(id, name, description string, assetIDs []string) {
+	albumAssets := make([]*immich.Asset, len(assetIDs))
+	for i, aid := range assetIDs {
+		albumAssets[i] = &immich.Asset{ID: aid}
+	}
+	uc.cachedAlbums = append(uc.cachedAlbums, albumResult{
+		album: immich.AlbumContent{
+			ID:          id,
+			AlbumName:   name,
+			Description: description,
+			Assets:      albumAssets,
+		},
+	})
+}
+
+// appendAssetsToCachedAlbum adds asset IDs to an existing album in cachedAlbums
+// so the next month's merge knows about them.
+func (uc *UpCmd) appendAssetsToCachedAlbum(albumID string, newIDs []string) {
+	for i := range uc.cachedAlbums {
+		if uc.cachedAlbums[i].err != nil {
+			continue
+		}
+		if uc.cachedAlbums[i].album.ID == albumID {
+			for _, id := range newIDs {
+				uc.cachedAlbums[i].album.Assets = append(uc.cachedAlbums[i].album.Assets, &immich.Asset{ID: id})
+			}
+			return
+		}
+	}
 }
 
 func (uc *UpCmd) saveTags(ctx context.Context, tag assets.Tag, ids []string) (assets.Tag, error) {
@@ -98,8 +146,14 @@ func (uc *UpCmd) finishing(ctx context.Context) error {
 	}
 	defer func() { uc.finished = true }()
 	// do waiting operations
-	uc.albumsCache.Close()
-	uc.tagsCache.Close()
+	if uc.albumsCache != nil {
+		uc.albumsCache.Close()
+		uc.albumsCache = nil
+	}
+	if uc.tagsCache != nil {
+		uc.tagsCache.Close()
+		uc.tagsCache = nil
+	}
 
 	// Resume immich background jobs if requested
 	err := uc.resumeJobs(ctx)
@@ -116,9 +170,34 @@ func (uc *UpCmd) finishing(ctx context.Context) error {
 				uc.app.Log().Info(s)
 			}
 		}
+
+		// Write error report file if there were errors
+		if tracker := uc.app.FileProcessor().Tracker(); tracker != nil {
+			errs := tracker.GetErrors()
+			if len(errs) > 0 {
+				uc.writeErrorReport(errs)
+			}
+		}
 	}
 
 	return nil
+}
+
+func (uc *UpCmd) writeErrorReport(errs []assettracker.AssetRecord) {
+	reportFile := fmt.Sprintf("immich-go-errors-%s.txt", time.Now().Format("2006-01-02T15-04-05"))
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("immich-go error report - %s\n", time.Now().Format("2006-01-02 15:04:05")))
+	sb.WriteString(fmt.Sprintf("Total errors: %d\n\n", len(errs)))
+	for _, e := range errs {
+		sb.WriteString(fmt.Sprintf("%-20s %s\n  Error: %s\n\n", e.EventCode, e.File.FullName(), e.Reason))
+	}
+
+	if err := os.WriteFile(reportFile, []byte(sb.String()), 0o644); err != nil {
+		uc.app.Log().Error("can't write error report", "file", reportFile, "err", err)
+		return
+	}
+	fmt.Printf("\nError report written to: %s\n", reportFile)
+	uc.app.Log().Info("Error report written", "file", reportFile, "errors", len(errs))
 }
 
 func (uc *UpCmd) upload(ctx context.Context, adapter adapters.Reader) error {
@@ -138,6 +217,25 @@ func (uc *UpCmd) upload(ctx context.Context, adapter adapters.Reader) error {
 			fmt.Println(uc.app.FileProcessor().GenerateReport())
 		}
 	}()
+
+	uc.adapter = adapter
+
+	// Check if adapter supports batched mode
+	drp, hasBatching := adapter.(adapters.DateRangeProvider)
+	if hasBatching {
+		return uc.uploadBatched(ctx, adapter, drp)
+	}
+
+	// Fall back to existing behavior (unchanged)
+	return uc.uploadUnbatched(ctx, adapter)
+}
+
+// uploadUnbatched is the original upload path: fetch all server assets, then upload everything.
+// Used when the adapter does not implement DateRangeProvider.
+func (uc *UpCmd) uploadUnbatched(ctx context.Context, adapter adapters.Reader) error {
+	ctx, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil)
+
 	uc.albumsCache = cache.NewCollectionCache(50, func(album assets.Album, ids []string) (assets.Album, error) {
 		return uc.saveAlbum(ctx, album, ids)
 	})
@@ -145,10 +243,10 @@ func (uc *UpCmd) upload(ctx context.Context, adapter adapters.Reader) error {
 		return uc.saveTags(ctx, tag, ids)
 	})
 
-	uc.adapter = adapter
-
 	runner := uc.runUI
 	uc.assetIndex = newAssetIndex()
+	uc.immichAssetsReady = make(chan struct{})
+	uc.immichAlbumsReady = make(chan struct{})
 
 	if uc.NoUI {
 		runner = uc.runNoUI
@@ -164,50 +262,383 @@ func (uc *UpCmd) upload(ctx context.Context, adapter adapters.Reader) error {
 	return err
 }
 
-func (uc *UpCmd) getImmichAlbums(ctx context.Context) error {
-	// Get the album list from the server, but without assets.
+// uploadBatched processes uploads month by month, scoping server queries
+// to each month's date range for memory efficiency.
+func (uc *UpCmd) uploadBatched(ctx context.Context, adapter adapters.Reader, drp adapters.DateRangeProvider) error {
+	// 1. PreScan to get month list
+	uc.app.Log().Info("Pre-scanning to determine month list...")
+	months, err := drp.PreScan(ctx)
+	if err != nil {
+		return fmt.Errorf("pre-scan failed: %w", err)
+	}
+	uc.app.Log().Info(fmt.Sprintf("Pre-scan found %d months", len(months)))
+
+	// Check if there are no-date files; if so, add a no-date batch at the end
+	if provider, ok := adapter.(interface{ HasNoDateFiles() bool }); ok && provider.HasNoDateFiles() {
+		months = append(months, adapters.MonthNoDate)
+	}
+
+	// 2. Load state
+	serverURL := uc.client.Server
+	archivePath := "" // derive from adapter if possible
+	if named, ok := adapter.(interface{ ArchivePath() string }); ok {
+		archivePath = named.ArchivePath()
+	}
+
+	stateDir := uc.StateDir
+	if stateDir == "" {
+		stateDir = DefaultStateDir(serverURL, archivePath)
+	}
+
+	uc.state, err = LoadState(stateDir, serverURL, archivePath)
+	if err != nil {
+		return fmt.Errorf("can't load state: %w", err)
+	}
+
+	if uc.ResetState {
+		uc.state.ResetState()
+		if err := uc.state.SaveState(); err != nil {
+			return fmt.Errorf("can't save reset state: %w", err)
+		}
+		fmt.Printf("State has been reset for %s -> %s\n", archivePath, serverURL)
+	}
+
+	if uc.ShowState {
+		completed := len(uc.state.CompletedMonths)
+		total := len(months)
+		remaining := 0
+		for _, m := range months {
+			if !uc.state.IsMonthCompleted(m) {
+				remaining++
+			}
+		}
+		nextMonth := ""
+		for _, m := range months {
+			if !uc.state.IsMonthCompleted(m) {
+				nextMonth = m
+				break
+			}
+		}
+		fmt.Printf("Upload state for %s -> %s\n", archivePath, serverURL)
+		fmt.Printf("  Total months: %d\n", total)
+		fmt.Printf("  Completed:    %d\n", completed)
+		fmt.Printf("  Remaining:    %d\n", remaining)
+		if nextMonth != "" {
+			fmt.Printf("  Next month:   %s\n", nextMonth)
+		}
+		fmt.Printf("  Last updated: %s\n", uc.state.UpdatedAt.Format("2006-01-02 15:04"))
+		return nil
+	}
+
+	// 3. Filter months: remove completed, apply batch-limit
+	var remaining []string
+	var skippedMonths []string
+	for _, m := range months {
+		if uc.state.IsMonthCompleted(m) {
+			skippedMonths = append(skippedMonths, m)
+		} else {
+			remaining = append(remaining, m)
+		}
+	}
+
+	if len(skippedMonths) > 0 {
+		uc.app.Log().Info(fmt.Sprintf("Skipping %d already completed months: %s", len(skippedMonths), strings.Join(skippedMonths, ", ")))
+	}
+
+	if len(remaining) == 0 {
+		uc.app.Log().Info("All months already completed. Nothing to do.")
+		return nil
+	}
+
+	if uc.BatchLimit > 0 && len(remaining) > uc.BatchLimit {
+		remaining = remaining[:uc.BatchLimit]
+	}
+
+	uc.app.Log().Info(fmt.Sprintf("Processing %d months (of %d remaining): %s", len(remaining), len(months)-len(skippedMonths), strings.Join(remaining, ", ")))
+
+	// 4. Build the month-loop function that will be called from within either UI or NoUI
+	uc.batchTotal = len(remaining)
+	monthLoop := func(ctx context.Context) error {
+		for i, month := range remaining {
+			select {
+			case <-ctx.Done():
+				return context.Cause(ctx)
+			default:
+			}
+			uc.batchCurrent = i + 1
+			err := uc.processMonth(ctx, adapter, drp, month)
+			if err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+
+	// 5. Run with UI or NoUI
+	useUI := !uc.NoUI
+	if useUI {
+		_, err := tcell.NewScreen()
+		if err != nil {
+			uc.app.Log().Warn("can't initialize the screen for the UI mode. Falling back to no-gui mode", "err", err)
+			fmt.Println("can't initialize the screen for the UI mode. Falling back to no-gui mode")
+			useUI = false
+		}
+	}
+
+	if useUI {
+		err = uc.runBatchedUI(ctx, monthLoop)
+	} else {
+		err = monthLoop(ctx)
+	}
+	if err != nil {
+		return err
+	}
+
+	// Print batch summary
+	counts := uc.app.FileProcessor().Logger().GetCounts()
+	uploaded := counts[fileevent.ProcessedUploadSuccess]
+	skipped := counts[fileevent.DiscardedServerDuplicate]
+	errCount := counts[fileevent.ErrorUploadFailed] + counts[fileevent.ErrorServerError] + counts[fileevent.ErrorFileAccess]
+
+	firstMonth := remaining[0]
+	lastMonth := remaining[len(remaining)-1]
+	fmt.Printf("\nBatch complete: processed %s through %s (%d months)\n", firstMonth, lastMonth, len(remaining))
+	fmt.Printf("  Uploaded: %d assets\n", uploaded)
+	fmt.Printf("  Skipped:  %d (already on server)\n", skipped)
+	fmt.Printf("  Errors:   %d\n", errCount)
+
+	completedTotal := len(uc.state.CompletedMonths)
+	totalMonths := len(months)
+	nextMonth := ""
+	for _, m := range months {
+		if !uc.state.IsMonthCompleted(m) {
+			nextMonth = m
+			break
+		}
+	}
+	if nextMonth != "" {
+		fmt.Printf("Progress: %d/%d months complete. Next: %s\n", completedTotal, totalMonths, nextMonth)
+	} else {
+		fmt.Printf("Progress: %d/%d months complete. All done!\n", completedTotal, totalMonths)
+	}
+
+	return nil
+}
+
+// processMonth handles uploading all assets for a single month.
+// It creates a fresh asset index, fetches server assets scoped to the month's date range,
+// browses local files for the month, and runs the upload loop.
+func (uc *UpCmd) processMonth(ctx context.Context, adapter adapters.Reader, drp adapters.DateRangeProvider, month string) error {
+	ctx, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil)
+
+	uc.app.Log().Info(fmt.Sprintf("Processing month: %s", month))
+	uc.currentMonth = month
+
+	// Fresh asset index per month (key for memory efficiency)
+	uc.assetIndex = newAssetIndex()
+	uc.immichAssetsReady = make(chan struct{})
+	uc.immichAlbumsReady = make(chan struct{})
+
+	// Set in-progress
+	uc.state.SetInProgressMonth(month)
+	if err := uc.state.SaveState(); err != nil {
+		uc.app.Log().Error("can't save state", "err", err)
+	}
+
+	// Create fresh caches per month
+	uc.albumsCache = cache.NewCollectionCache(50, func(album assets.Album, ids []string) (assets.Album, error) {
+		return uc.saveAlbum(ctx, album, ids)
+	})
+	uc.tagsCache = cache.NewCollectionCache(50, func(tag assets.Tag, ids []string) (assets.Tag, error) {
+		return uc.saveTags(ctx, tag, ids)
+	})
+
+	// Reset delete list per month
+	uc.deleteServerList = nil
+	uc.finished = false
+
+	// Determine the browse function for this month
+	groupChan := drp.BrowseMonth(ctx, month)
+
+	// Determine the asset fetch function for this month
+	var dr *cliflags.DateRange
+	if month != adapters.MonthNoDate {
+		after, before, err := adapters.MonthToDateRange(month)
+		if err != nil {
+			return fmt.Errorf("invalid month %q: %w", month, err)
+		}
+		dr = &cliflags.DateRange{After: after, Before: before}
+	}
+
+	// Run the parallel initialization + upload using runMonthNoUI
+	// (always NoUI for batched mode to keep it simple and avoid UI flicker per month)
+	errsBefore := uc.app.NumErrors()
+	err := uc.runMonthNoUI(ctx, dr, groupChan)
+
+	// Clean up per-month resources
+	if uc.albumsCache != nil {
+		uc.albumsCache.Close()
+		uc.albumsCache = nil
+	}
+	if uc.tagsCache != nil {
+		uc.tagsCache.Close()
+		uc.tagsCache = nil
+	}
+
+	if err != nil {
+		return err
+	}
+
+	// Only mark the month complete if no errors occurred during processing.
+	// In continue/retry mode, ProcessError swallows errors to keep going,
+	// but we must not mark the month done so that failed files are retried
+	// on the next run.
+	if uc.app.NumErrors() > errsBefore {
+		uc.app.Log().Warn(fmt.Sprintf("Month %s had errors, not marking as complete", month))
+		if err := uc.state.FlushState(); err != nil {
+			uc.app.Log().Error("can't save state", "err", err)
+		}
+	} else {
+		uc.state.CompleteMonth(month)
+		if err := uc.state.SaveState(); err != nil {
+			uc.app.Log().Error("can't save state after completing month", "err", err)
+		}
+		uc.app.Log().Info(fmt.Sprintf("Completed month: %s", month))
+	}
+
+	return nil
+}
+
+// runMonthNoUI runs the parallel initialization and upload loop for a single month
+// in the batched upload flow. It fetches server assets scoped to the date range,
+// fetches albums, and runs the upload loop — all in parallel to avoid deadlock
+// (BrowseMonth's channel must be drained concurrently with server asset fetching).
+func (uc *UpCmd) runMonthNoUI(ctx context.Context, dr *cliflags.DateRange, groupChan chan *assets.Group) error {
+	ctx, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil)
+
+	processGrp := errgroup.Group{}
+
+	processGrp.Go(func() error {
+		var err error
+		if dr != nil {
+			err = uc.getImmichAssetsFiltered(ctx, *dr, uc.immichUpdateFn)
+		} else {
+			// no-date batch: fetch all assets (or skip server fetch)
+			err = uc.getImmichAssetsFiltered(ctx, cliflags.DateRange{}, uc.immichUpdateFn)
+		}
+		if err != nil {
+			cancel(err)
+		}
+		return err
+	})
+	processGrp.Go(func() error {
+		return uc.getImmichAlbums(ctx)
+	})
+
+	// uploadLoop must run in parallel so it drains groupChan while server
+	// assets are being fetched. uploadLoop already waits for immichAssetsReady
+	// before processing each asset.
+	var uploadErr error
+	processGrp.Go(func() error {
+		uploadErr = uc.uploadLoop(ctx, groupChan)
+		if uploadErr != nil {
+			cancel(uploadErr)
+		}
+		return uploadErr
+	})
+
+	err := processGrp.Wait()
+	if err != nil {
+		cause := context.Cause(ctx)
+		if cause != nil {
+			return cause
+		}
+		return err
+	}
+	return nil
+}
+
+type albumResult struct {
+	album immich.AlbumContent
+	err   error
+}
+
+// fetchAlbumDetails fetches all album details from the server concurrently.
+// Results are cached on UpCmd so subsequent calls are a no-op.
+func (uc *UpCmd) fetchAlbumDetails(ctx context.Context) error {
+	if uc.albumsFetched {
+		return nil
+	}
+
 	serverAlbums, err := uc.client.Immich.GetAllAlbums(ctx)
 	if err != nil {
 		return fmt.Errorf("can't get the album list from the server: %w", err)
 	}
 
+	results := make([]albumResult, len(serverAlbums))
+	const maxConcurrent = 5
+	pool := worker.NewPool(min(maxConcurrent, max(1, len(serverAlbums))))
+	var wg sync.WaitGroup
+
+	for i, sa := range serverAlbums {
+		wg.Add(1)
+		i, sa := i, sa
+		pool.Submit(func() {
+			defer wg.Done()
+			r, err := uc.client.Immich.GetAlbumInfo(ctx, sa.ID, false)
+			results[i] = albumResult{album: r, err: err}
+		})
+	}
+	wg.Wait()
+	pool.Stop()
+
+	uc.cachedAlbums = results
+	uc.albumsFetched = true
+	uc.app.Log().Info(fmt.Sprintf("Fetched %d album details from server", len(results)))
+	return nil
+}
+
+// getImmichAlbums fetches album details (once) and merges them into the
+// current assetIndex and albumsCache. Safe to call multiple times — the
+// server fetch is cached, only the merge runs again.
+func (uc *UpCmd) getImmichAlbums(ctx context.Context) error {
+	if err := uc.fetchAlbumDetails(ctx); err != nil {
+		return err
+	}
+
+	// Wait for asset index to be ready before merging
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
 	case <-uc.immichAssetsReady:
-		// Wait for the server's assets to be ready.
-		for _, a := range serverAlbums {
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			default:
-				// Get the album info from the server, with assets.
-				r, err := uc.client.Immich.GetAlbumInfo(ctx, a.ID, false)
-				if err != nil {
-					uc.app.Log().Error("can't get the album info from the server", "album", a.AlbumName, "err", err)
-					continue
-				}
-				ids := make([]string, 0, len(r.Assets))
-				for _, aa := range r.Assets {
-					ids = append(ids, aa.ID)
-				}
+	}
 
-				album := assets.NewAlbum(a.ID, a.AlbumName, a.Description)
-				uc.albumsCache.NewCollection(a.AlbumName, album, ids)
-				uc.app.Log().Info("got album from the server", "album", a.AlbumName, "assets", len(r.Assets))
-				uc.app.Log().Debug("got album from the server", "album", a.AlbumName, "assets", ids)
-				// assign the album to the assets
-				for _, id := range ids {
-					a := uc.assetIndex.getByID(id)
-					if a == nil {
-						uc.app.Log().Debug("processing the immich albums: asset not found in index", "id", id)
-						continue
-					}
-					a.Albums = append(a.Albums, album)
-				}
+	// Merge cached results into the current asset index
+	for _, res := range uc.cachedAlbums {
+		if res.err != nil {
+			continue
+		}
+		r := res.album
+		ids := make([]string, 0, len(r.Assets))
+		for _, aa := range r.Assets {
+			ids = append(ids, aa.ID)
+		}
+
+		album := assets.NewAlbum(r.ID, r.AlbumName, r.Description)
+		uc.albumsCache.NewCollection(r.AlbumName, album, ids)
+		for _, id := range ids {
+			a := uc.assetIndex.getByID(id)
+			if a == nil {
+				continue
 			}
+			a.Albums = append(a.Albums, album)
 		}
 	}
+
+	// Signal that albums are ready for use by uploadLoop
+	close(uc.immichAlbumsReady)
 	return nil
 }
 
@@ -254,10 +685,60 @@ func (uc *UpCmd) getImmichAssets(ctx context.Context, updateFn progressUpdate) e
 	return nil
 }
 
+// getImmichAssetsFiltered fetches server assets scoped to a date range
+// (used in batched mode). If the date range is not set, it falls back
+// to GetAllAssets (used for the no-date batch).
+func (uc *UpCmd) getImmichAssetsFiltered(ctx context.Context, dr cliflags.DateRange, updateFn progressUpdate) error {
+	defer close(uc.immichAssetsReady)
+	received := 0
+
+	filter := func(a *immich.Asset) error {
+		if updateFn != nil {
+			defer func() {
+				updateFn(received, received)
+			}()
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+			received++
+			if a.OwnerID != uc.client.User.ID {
+				return nil
+			}
+			if a.LibraryID != "" {
+				return nil
+			}
+			uc.assetIndex.addImmichAsset(a)
+			return nil
+		}
+	}
+
+	var err error
+	if dr.After.IsZero() && dr.Before.IsZero() {
+		// no-date batch or empty date range: fetch all
+		err = uc.client.Immich.GetAllAssets(ctx, filter)
+	} else {
+		err = uc.client.Immich.GetFilteredAssetsFn(ctx, immich.SearchOptions().All().WithDateRange(dr), filter)
+	}
+	if err != nil {
+		return err
+	}
+	if updateFn != nil {
+		updateFn(received, received)
+	}
+	uc.app.Log().Info(fmt.Sprintf("Assets on the server (filtered): %d", uc.assetIndex.len()))
+	return nil
+}
+
 func (uc *UpCmd) uploadLoop(ctx context.Context, groupChan chan *assets.Group) error {
 	ctx, cancel := context.WithCancelCause(ctx)
 
-	// the goroutine submits the groups, and stops when then number of error is higher than tolerated
+	useAdaptive := uc.app.OnErrors == cliflags.OnErrorsRetry
+	throttle := worker.NewThrottle(uc.app.ConcurrentTask)
+
+	var consecutiveSuccesses atomic.Int64
+
 	var wg sync.WaitGroup
 	wg.Go(func() {
 		workers := worker.NewPool(uc.app.ConcurrentTask)
@@ -271,12 +752,45 @@ func (uc *UpCmd) uploadLoop(ctx context.Context, groupChan chan *assets.Group) e
 				if !ok {
 					return
 				}
+				if useAdaptive {
+					throttle.Acquire()
+				}
 				workers.Submit(func() {
+					if useAdaptive {
+						defer throttle.Release()
+					}
 					err := uc.handleGroup(ctx, g)
 					if err != nil {
+						if useAdaptive && immich.IsRetryable(err) {
+							consecutiveSuccesses.Store(0)
+							cur := throttle.Current()
+							newLevel := max(cur/2, 1)
+							if newLevel < cur {
+								throttle.SetConcurrency(newLevel)
+								uc.app.Log().Info("Reducing concurrency due to server errors", "from", cur, "to", newLevel)
+							}
+							// Brief pause to let server recover
+							select {
+							case <-time.After(5 * time.Second):
+							case <-ctx.Done():
+							}
+						}
 						err = uc.app.ProcessError(err)
 						if err != nil {
 							cancel(err)
+						}
+					} else {
+						if useAdaptive {
+							n := consecutiveSuccesses.Add(1)
+							if n%10 == 0 {
+								cur := throttle.Current()
+								maxLevel := throttle.Max()
+								if cur < maxLevel {
+									newLevel := min(cur+1, maxLevel)
+									throttle.SetConcurrency(newLevel)
+									uc.app.Log().Info("Increasing concurrency after consecutive successes", "from", cur, "to", newLevel)
+								}
+							}
 						}
 					}
 				})
@@ -317,7 +831,7 @@ func (uc *UpCmd) handleGroup(ctx context.Context, g *assets.Group) error {
 	// Upload assets from the group
 	for _, a := range g.Assets {
 		err := uc.handleAsset(ctx, a)
-		errGroup = errors.Join(err)
+		errGroup = errors.Join(errGroup, err)
 	}
 
 	// Manage groups
@@ -349,7 +863,27 @@ func (uc *UpCmd) handleAsset(ctx context.Context, a *assets.Asset) error {
 		a.Close() // Close and clean resources linked to the local asset
 	}()
 
-	// var status stri g
+	// Wait for server asset index to be ready before checking duplicates
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-uc.immichAssetsReady:
+	}
+
+	// In batched mode, check if this file was already uploaded in a previous run
+	if uc.state != nil {
+		source := ""
+		if fs, ok := a.File.FS().(interface{ Name() string }); ok {
+			source = fs.Name()
+		}
+		filePath := a.File.Name()
+		if uc.state.IsFileUploaded(source, filePath, int64(a.FileSize)) {
+			uc.resumeSkipped.Add(1)
+			uc.app.Log().Info("Skipping file already uploaded in previous run", "file", filePath)
+			return nil
+		}
+	}
+
 	advice, err := uc.assetIndex.ShouldUpload(a, uc)
 	if err != nil {
 		return err
@@ -488,6 +1022,20 @@ func (uc *UpCmd) uploadAsset(ctx context.Context, a *assets.Asset) (string, erro
 		uc.app.FileProcessor().Logger().Record(ctx, fileevent.ProcessedMetadataUpdated, a.File)
 	}
 	uc.assetIndex.addLocalAsset(a)
+
+	// Record upload in state file for resume support
+	if uc.state != nil {
+		source := ""
+		if fs, ok := a.File.FS().(interface{ Name() string }); ok {
+			source = fs.Name()
+		}
+		if shouldSave := uc.state.RecordFileUploaded(source, a.File.Name(), int64(a.FileSize)); shouldSave {
+			if err := uc.state.SaveState(); err != nil {
+				uc.app.Log().Error("can't save state after upload", "err", err)
+			}
+		}
+	}
+
 	return ar.Status, nil
 }
 
@@ -536,6 +1084,15 @@ func (uc *UpCmd) replaceAsset(ctx context.Context, newAsset, oldAsset *assets.As
 func (uc *UpCmd) manageAssetAlbums(ctx context.Context, f fshelper.FSAndName, ID string, albums []assets.Album) {
 	if len(albums) == 0 {
 		return
+	}
+
+	// Wait for server albums to be merged into albumsCache before adding
+	// assets. Without this, we'd create new albums instead of reusing
+	// existing ones from the server.
+	select {
+	case <-ctx.Done():
+		return
+	case <-uc.immichAlbumsReady:
 	}
 
 	for _, album := range albums {
